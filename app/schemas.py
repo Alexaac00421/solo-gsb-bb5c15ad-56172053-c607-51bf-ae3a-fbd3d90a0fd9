@@ -1,0 +1,390 @@
+"""API 请求/响应模式。"""
+from __future__ import annotations
+
+import math
+from datetime import datetime
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
+
+# 标识（批次/任务/机床编号）：字母数字开头，可含 _ . : -，最长 64
+_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$"
+
+
+def _finite(v: float, name: str) -> float:
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        raise ValueError(f"{name} 必须为数值")
+    if not math.isfinite(float(v)):
+        raise ValueError(f"{name} 必须为有限数值")
+    return float(v)
+
+
+class Point(BaseModel):
+    x: float
+    y: float
+
+    @field_validator("x", "y")
+    @classmethod
+    def _chk(cls, v: float) -> float:
+        return _finite(v, "坐标")
+
+
+class ZoneCreate(BaseModel):
+    """登记新禁区。zone_no 省略时自动分配。"""
+    zone_no: int | None = Field(default=None, ge=1)
+    polygon: list[tuple[float, float]] = Field(min_length=3)
+    z_min: float
+    z_max: float
+    description: str | None = Field(default=None, max_length=500)
+
+    @field_validator("z_min", "z_max")
+    @classmethod
+    def _z(cls, v: float) -> float:
+        return _finite(v, "Z 高度")
+
+
+class ZoneVersionCreate(BaseModel):
+    """登记某禁区的新版本（几何不可变修改 => 新版本）。"""
+    polygon: list[tuple[float, float]] = Field(min_length=3)
+    z_min: float
+    z_max: float
+    description: str | None = Field(default=None, max_length=500)
+
+    @field_validator("z_min", "z_max")
+    @classmethod
+    def _z(cls, v: float) -> float:
+        return _finite(v, "Z 高度")
+
+
+class ZoneVersionOut(BaseModel):
+    version_id: int
+    version: int
+    polygon: list[tuple[float, float]]
+    z_min: float
+    z_max: float
+    created_at: datetime
+
+
+class ZoneOut(BaseModel):
+    zone_id: int
+    zone_no: int
+    description: str | None
+    current_version: int
+    created_at: datetime
+
+
+class ZoneDetailOut(ZoneOut):
+    versions: list[ZoneVersionOut]
+
+
+class ZoneRef(BaseModel):
+    """审查引用：禁区编号 + 明确版本号。"""
+    zone_no: int = Field(ge=1)
+    version: int = Field(ge=1)
+
+
+# ---------- 机床禁区基线 ----------
+
+class BaselineRef(BaseModel):
+    """基线引用：机床编号 + 基线版本（审查时解析为该版本的禁区快照）。"""
+    machine_no: str = Field(min_length=1, max_length=64, pattern=_ID_PATTERN)
+    version: int = Field(ge=1)
+
+
+class BaselineCreate(BaseModel):
+    """提交机床禁区基线：机床编号 + 一组互不重复的禁区编号与明确版本。
+
+    同一机床编号首次提交为版本 1；每次修订（再次提交）产生递增且不可变
+    的新版本，旧版本永久保留。
+    """
+    machine_no: str = Field(min_length=1, max_length=64, pattern=_ID_PATTERN)
+    zones: list[ZoneRef] = Field(min_length=1)
+    description: str | None = Field(default=None, max_length=500)
+
+    @model_validator(mode="after")
+    def _unique_zone_nos(self) -> "BaselineCreate":
+        seen: set[int] = set()
+        for ref in self.zones:
+            if ref.zone_no in seen:
+                raise ValueError(f"禁区编号 {ref.zone_no} 在基线中重复")
+            seen.add(ref.zone_no)
+        return self
+
+
+class BaselineOut(BaseModel):
+    """机床基线的一个不可变版本：基线版本与固定禁区清单。"""
+    machine_no: str
+    version: int
+    zones: list[ZoneRef] = Field(description="固化的禁区编号+明确版本清单")
+    description: str | None
+    created_at: datetime
+
+
+class BaselineSummaryOut(BaseModel):
+    """机床基线概览：当前（最大）版本号与最近修订时间。"""
+    machine_no: str
+    current_version: int
+    created_at: datetime
+
+
+class BaselineDetailOut(BaseModel):
+    """某机床的全部基线版本（旧版本永久保留可查询）。"""
+    machine_no: str
+    current_version: int
+    versions: list[BaselineOut]
+
+
+class ReviewParamsBase(BaseModel):
+    """审查参数基类：禁区引用（zones 直传或机床基线）、初始刀尖、刀半径、
+    可选净间隙/多刀。
+
+    POST /reviews 与分块上传会话创建（POST /uploads）共用同一套校验，
+    保证两种提交方式的审查口径完全一致。
+    """
+    # zones 与 baseline 必须且只能提供其一（见下方校验）：
+    # zones 直传禁区编号+明确版本；baseline 以 机床编号+基线版本 引用
+    # 已核准的禁区组合，审查时解析为该基线版本固化的禁区版本快照
+    zones: list[ZoneRef] | None = Field(default=None, min_length=1)
+    baseline: BaselineRef | None = None
+    start: tuple[float, float, float]
+    tool_radius: float = Field(ge=0.0)
+    # 可选：启用后计算全程最小水平净间隙并随报告固化
+    include_min_clearance: bool = False
+    # 可选：多刀模式。非负整数刀号 -> 非负有限毫米半径。
+    # 传入（含空映射）即启用：初始刀位仍用 tool_radius，G-code 中 Tn 切换；
+    # 不传时 T 被忽略，保持单刀旧行为。
+    tool_radii: dict[int, float] | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one_zone_source(self) -> "ReviewParamsBase":
+        if self.zones is None and self.baseline is None:
+            raise ValueError(
+                "必须提供 zones 或 baseline（机床编号+基线版本）之一")
+        if self.zones is not None and self.baseline is not None:
+            raise ValueError(
+                "zones 与 baseline（机床编号+基线版本）不可同时提供")
+        return self
+
+    @field_validator("include_min_clearance", mode="before")
+    @classmethod
+    def _strict_bool(cls, v):
+        # 仅接受真正的布尔值；拒绝 "true"/1 等隐式转换，属非法输入（422）
+        if not isinstance(v, bool):
+            raise ValueError("include_min_clearance 必须为布尔值 true/false")
+        return v
+
+    @field_validator("tool_radii", mode="before")
+    @classmethod
+    def _validate_tool_radii(cls, v):
+        # 未传 => 单刀旧模式
+        if v is None:
+            return None
+        if not isinstance(v, dict):
+            raise ValueError("tool_radii 必须为刀号到半径（mm）的映射对象")
+        normalized: dict[int, float] = {}
+        for raw_k, raw_val in v.items():
+            # JSON 键天然为字符串：接受十进制非负整数写法（如 "0"/"2"）；
+            # 拒绝小数/负数/布尔/其他类型
+            if isinstance(raw_k, bool):
+                raise ValueError("刀号必须为非负整数")
+            k: int
+            if isinstance(raw_k, int):
+                if raw_k < 0:
+                    raise ValueError("刀号必须为非负整数")
+                k = raw_k
+            elif isinstance(raw_k, str) and raw_k.isdigit():
+                k = int(raw_k)
+            else:
+                raise ValueError(f"刀号 {raw_k!r} 非法：必须为非负整数")
+            if isinstance(raw_val, bool) or not isinstance(raw_val, (int, float)):
+                raise ValueError(f"刀号 {k} 的半径必须为非负有限毫米数值")
+            rv = float(raw_val)
+            if not math.isfinite(rv) or rv < 0.0:
+                raise ValueError(f"刀号 {k} 的半径必须为非负有限毫米数值")
+            if k in normalized:
+                raise ValueError(f"刀号 {k} 在映射中重复")
+            normalized[k] = rv
+        return normalized
+
+    @field_validator("tool_radius")
+    @classmethod
+    def _radius(cls, v: float) -> float:
+        return _finite(v, "刀具半径")
+
+    @field_validator("start")
+    @classmethod
+    def _start(cls, v: tuple[float, float]) -> tuple[float, float, float]:
+        if len(v) != 3:
+            raise ValueError("初始刀尖坐标必须为 [x, y, z]")
+        for c in v:
+            _finite(c, "初始刀尖坐标")
+        return tuple(float(c) for c in v)  # type: ignore[return-value]
+
+
+class ReviewRequest(ReviewParamsBase):
+    gcode: str = Field(min_length=1)
+
+
+class MinClearanceOut(BaseModel):
+    """全程最小水平净间隙结果（毫米；净间隙可为负）。"""
+    min_clearance_mm: float
+    line_no: int | None
+    point_mm: tuple[float, float, float]
+    zone_no: int
+    progress: float = Field(description="取得最小值处的段内进度（直线 t / 圆弧 s）")
+    # 多刀模式固化：取得最小值时生效刀号（初始刀位为 null）与半径（mm）。
+    # 两者均为 null 表示单刀模式（旧请求），序列化时省略，保持旧报告/旧客户端兼容。
+    tool_no: int | None = None
+    tool_radius_mm: float | None = None
+
+    @model_serializer(mode="plain")
+    def _serialize(self):
+        data = {
+            "min_clearance_mm": self.min_clearance_mm,
+            "line_no": self.line_no,
+            "point_mm": list(self.point_mm),
+            "zone_no": self.zone_no,
+            "progress": self.progress,
+        }
+        if self.tool_no is not None or self.tool_radius_mm is not None:
+            data["tool_no"] = self.tool_no
+            data["tool_radius_mm"] = self.tool_radius_mm
+        return data
+
+
+class TraceEventOut(BaseModel):
+    """执行事件轨迹中的一项（多刀模式，按执行顺序）。
+
+    kind：initial（初始刀位）/ tool_change（T 切换时的静止刀位，
+    含与运动同行、先于本行运动）/ motion（运动段）。
+    """
+    seq: int = Field(description="执行顺序（初始刀位为 0，从 1 起递增）")
+    kind: Literal["initial", "tool_change", "motion"]
+    line_no: int | None = Field(description="G-code 原行号；初始刀位为 null")
+    tool_no: int | None = Field(description="生效刀号；初始刀位为 null")
+    tool_radius_mm: float = Field(description="生效刀具半径（mm）")
+    start_mm: tuple[float, float, float] = Field(
+        description="事件起点刀尖坐标 [x, y, z]（mm）")
+    end_mm: tuple[float, float, float] = Field(
+        description="事件终点刀尖坐标 [x, y, z]（mm）；静止事件与起点相同")
+    hit_zone_no: int | None = Field(
+        description="该事件命中的禁区编号（段内取最早命中），未命中为 null")
+
+
+class ReviewResponse(BaseModel):
+    report_id: int
+    used_zone_versions: dict[str, int]
+    input_summary: dict[str, Any]
+    has_collision: bool
+    collision_line_no: int | None
+    collision_zone_no: int | None
+    conclusion: Literal["collision", "no_collision"]
+    message: str
+    # 仅当请求 include_min_clearance=true 时非空；全程不在任何禁区高度内时为 null
+    min_clearance: MinClearanceOut | None = None
+    min_clearance_enabled: bool = False
+    # 多刀模式固化：命中时生效刀号（初始刀位为 null）与半径（mm）；
+    # 旧请求/旧报告这两个字段为 null
+    collision_tool_no: int | None = None
+    collision_tool_radius_mm: float | None = None
+    # 多刀模式固化的执行事件轨迹（初始刀位 -> 各 T 切换静止刀位 -> 各段运动）；
+    # 单刀请求与旧报告为 null
+    execution_trace: list[TraceEventOut] | None = None
+
+
+# ---------- 批量审查 ----------
+
+
+class BatchReviewItem(ReviewRequest):
+    """批量审查中的单项任务：完整单项审查输入 + 可选批内唯一任务标识。"""
+    task_id: str | None = Field(
+        default=None, min_length=1, max_length=64, pattern=_ID_PATTERN,
+        description="批内唯一任务标识；省略时按输入顺序号标识")
+
+
+class BatchReviewRequest(BaseModel):
+    """批量审查请求：1～50 项有序任务，同一事务校验并生成报告。
+
+    batch_id 为幂等键：相同 batch_id + 相同内容重放返回首次逐项结果；
+    相同 batch_id + 不同内容返回 409 冲突且不生成新报告。
+    """
+    batch_id: str = Field(min_length=1, max_length=64, pattern=_ID_PATTERN)
+    items: list[BatchReviewItem] = Field(min_length=1, max_length=50)
+
+    @model_validator(mode="after")
+    def _unique_task_ids(self) -> "BatchReviewRequest":
+        seen: set[str] = set()
+        for it in self.items:
+            if it.task_id is None:
+                continue
+            if it.task_id in seen:
+                raise ValueError(f"任务标识 {it.task_id!r} 在批内重复")
+            seen.add(it.task_id)
+        return self
+
+
+class BatchItemResult(BaseModel):
+    """批量审查逐项结果：输入顺序号、任务标识与该项完整审查结果。"""
+    index: int = Field(description="任务在请求中的输入顺序号（从 0 起）")
+    task_id: str | None
+    result: ReviewResponse
+
+
+class BatchReviewResponse(BaseModel):
+    batch_id: str
+    item_count: int
+    results: list[BatchItemResult]
+
+
+# ---------- 长 G-code 可恢复分块上传 ----------
+
+# 单块上限 64 KiB；会话总量上限 8 MiB；每块至少 1 字节 => 块数/序号上界
+MAX_CHUNK_BYTES = 64 * 1024
+MAX_TOTAL_BYTES = 8 * 1024 * 1024
+MAX_CHUNK_COUNT = MAX_TOTAL_BYTES
+
+
+class UploadSessionCreate(ReviewParamsBase):
+    """创建分块上传会话：冻结审查参数（同 POST /reviews，缺 gcode）。
+
+    禁区编号 + 明确版本（zones 直传或 机床编号+基线版本）、初始刀尖坐标、
+    刀半径与可选多刀/最小净间隙设置在创建时固定并落库；
+    G-code 随后以分块方式提交。
+    """
+
+
+class UploadSessionOut(BaseModel):
+    """上传会话状态：可查询已收序号、累计量与完成结果。"""
+    session_id: str
+    status: Literal["open", "completed"]
+    # 创建时冻结的审查参数（与 POST /reviews 同形，缺 gcode）
+    params: dict[str, Any]
+    # 已收块序号（升序）与累计统计
+    received_seqs: list[int]
+    received_count: int
+    total_bytes: int
+    max_chunk_bytes: int
+    max_total_bytes: int
+    # 完成声明与结果（未完成时为 null）
+    declared_chunk_count: int | None
+    declared_sha256: str | None
+    report_id: int | None
+    created_at: datetime
+    completed_at: datetime | None
+
+
+class ChunkReceipt(BaseModel):
+    """块回执：同号同内容重传返回同一回执（内容不变，天然幂等）。"""
+    session_id: str
+    seq: int
+    byte_len: int
+    sha256: str = Field(description="块内容（原始字节）的 SHA-256，小写 hex")
+
+
+class UploadCompleteRequest(BaseModel):
+    """完成声明：正整数块数 + 拼接后文本（UTF-8 字节）的 SHA-256。"""
+    chunk_count: int = Field(ge=1, le=MAX_CHUNK_COUNT,
+                             description="正整数块数：块 0..chunk_count-1 参与拼接")
+    sha256: str = Field(min_length=64, max_length=64,
+                        pattern=r"^[0-9a-fA-F]{64}$",
+                        description="拼接后文本的 SHA-256（hex，大小写均可）")
