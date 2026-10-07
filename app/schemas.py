@@ -388,3 +388,69 @@ class UploadCompleteRequest(BaseModel):
     sha256: str = Field(min_length=64, max_length=64,
                         pattern=r"^[0-9a-fA-F]{64}$",
                         description="拼接后文本的 SHA-256（hex，大小写均可）")
+
+
+# ---------- 工单刀路审查放行 ----------
+
+
+class ReleaseCreate(BaseModel):
+    """工单刀路审查放行请求（v1.7）：按工单锁定一台机床的放行结果。
+
+    work_order_no 为幂等键：相同工单 + 相同内容重放返回首次放行结果
+    （不随后续基线修订改变）；相同工单 + 不同内容 409 冲突。
+    machine_no + expected_version 给出预期基线；report_ids 为 1～50 个
+    有序、互不重复的既有报告编号，全部必须无碰撞，且每份报告固化的
+    基线引用（机床+版本）与固化禁区版本清单必须与该基线版本一致。
+    仅当预期版本仍是该机床当前版本时才能首次放行。
+    """
+    work_order_no: str = Field(min_length=1, max_length=64,
+                               pattern=_ID_PATTERN)
+    machine_no: str = Field(min_length=1, max_length=64, pattern=_ID_PATTERN)
+    expected_version: int = Field(ge=1)
+    report_ids: list[int] = Field(min_length=1, max_length=50)
+
+    @field_validator("report_ids")
+    @classmethod
+    def _unique_report_ids(cls, v: list[int]) -> list[int]:
+        seen: set[int] = set()
+        for rid in v:
+            # JSON 数字经类型校验均为正整数（int 类型），此处仅兜底布尔混入
+            if isinstance(rid, bool) or rid < 1:
+                raise ValueError("报告编号必须为正整数")
+            if rid in seen:
+                raise ValueError(f"报告编号 {rid} 在请求中重复")
+            seen.add(rid)
+        return v
+
+
+class ReleaseReportItem(BaseModel):
+    """放行结果中按顺序固化的单份报告摘要（不可变）。"""
+    index: int = Field(description="报告在放行请求中的顺序号（从 0 起）")
+    report_id: int
+    has_collision: bool
+    used_zone_versions: dict[str, int]
+
+
+class ReleaseOut(BaseModel):
+    """工单放行结果快照：成功放行后按工单查询永远返回同一内容。"""
+    work_order_no: str
+    machine_no: str
+    baseline_version: int = Field(
+        description="放行固化的机床基线版本（请求时的预期版本）")
+    machine_current_version: int = Field(
+        description="放行时刻该机床当前（最大）基线版本；首次放行等于固化版本")
+    report_ids: list[int] = Field(description="按请求顺序固化的报告编号")
+    report_count: int
+    reports: list[ReleaseReportItem] = Field(
+        description="按顺序固化的报告摘要（编号 + 无碰撞结论 + 禁区版本）")
+    released_at: datetime
+
+
+class ReleaseSummaryOut(BaseModel):
+    """工单放行概览：工单号、机床、固化基线版本与放行时间。"""
+    work_order_no: str
+    machine_no: str
+    baseline_version: int
+    machine_current_version: int
+    report_count: int
+    released_at: datetime

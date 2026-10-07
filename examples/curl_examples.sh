@@ -367,3 +367,119 @@ curl -s -o /dev/null -w "HTTP %{http_code}\n" -X POST "$BASE/reviews" \
   -d '{"zones": [{"zone_no": 1, "version": 1}],
        "baseline": {"machine_no": "MC-01", "version": 1},
        "start": [-5, 5, 0], "tool_radius": 0.0, "gcode": "G1 X1\n"}'
+
+# ---- 工单刀路审查放行（v1.7）----
+# 用专用机床 MC-REL 演示：先建当前基线 v1（引用禁区 1 的 v1），
+# 再用该基线出具无碰撞报告并办理工单放行。
+echo "== 32) 工单放行准备：建 MC-REL 基线 v1，并出具两份无碰撞报告 =="
+curl -s -X POST "$BASE/baselines" \
+  -H 'Content-Type: application/json' \
+  -d '{"machine_no": "MC-REL",
+       "zones": [{"zone_no": 1, "version": 1}],
+       "description": "工单放行演示机床"}' > /dev/null
+REL_R1=$(curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{"baseline": {"machine_no": "MC-REL", "version": 1},
+       "start": [-5, 50, 0], "tool_radius": 0.0,
+       "gcode": "G1 X15 Y50 Z0\n"}')
+REL_R2=$(curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{"baseline": {"machine_no": "MC-REL", "version": 1},
+       "start": [20, 20, 0], "tool_radius": 0.0,
+       "gcode": "G1 X25 Y25 Z0\n"}')
+REL_ID1=$(printf '%s' "$REL_R1" | sed -n 's/.*"report_id":\([0-9]*\).*/\1/p')
+REL_ID2=$(printf '%s' "$REL_R2" | sed -n 's/.*"report_id":\([0-9]*\).*/\1/p')
+echo "clear reports: $REL_ID1 $REL_ID2"
+
+echo "== 33) 工单刀路审查放行：工单号 + 机床 + 预期基线版本 + 有序报告编号（201） =="
+curl -s -X POST "$BASE/releases" \
+  -H 'Content-Type: application/json' \
+  -d "{
+        \"work_order_no\": \"WO-20261007-001\",
+        \"machine_no\": \"MC-REL\",
+        \"expected_version\": 1,
+        \"report_ids\": [$REL_ID2, $REL_ID1]
+      }"; echo
+
+echo "== 34) 同工单同内容重试 => 200，返回首次固化快照（不随后续修订改变） =="
+curl -s -o /dev/null -w "replay HTTP %{http_code}\n" -X POST "$BASE/releases" \
+  -H 'Content-Type: application/json' \
+  -d "{
+        \"work_order_no\": \"WO-20261007-001\",
+        \"machine_no\": \"MC-REL\",
+        \"expected_version\": 1,
+        \"report_ids\": [$REL_ID2, $REL_ID1]
+      }"
+
+echo "== 35) 按工单查询固化快照 / 列全部放行概览 =="
+curl -s "$BASE/releases/WO-20261007-001"; echo
+curl -s "$BASE/releases" | python3 -c 'import sys,json; print([r["work_order_no"] for r in json.load(sys.stdin)])'
+
+echo "== 36) 放行拒绝场景：异内容 409；碰撞报告 422；编号重复/数量越界 422 =="
+# 同工单异内容（报告集合不同）=> release_conflict
+curl -s -o /dev/null -w "different content HTTP %{http_code}\n" \
+  -X POST "$BASE/releases" \
+  -H 'Content-Type: application/json' \
+  -d "{
+        \"work_order_no\": \"WO-20261007-001\",
+        \"machine_no\": \"MC-REL\",
+        \"expected_version\": 1,
+        \"report_ids\": [$REL_ID1]
+      }"
+# 碰撞报告（横穿禁区 1 v1）=> release_report_has_collision
+HIT=$(curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{"baseline": {"machine_no": "MC-REL", "version": 1},
+       "start": [-5, 5, 0], "tool_radius": 0.0,
+       "gcode": "G1 X15 Y5 Z0\n"}' | sed -n 's/.*"report_id":\([0-9]*\).*/\1/p')
+curl -s -w "collision report HTTP %{http_code}\n" -X POST "$BASE/releases" \
+  -H 'Content-Type: application/json' \
+  -d "{
+        \"work_order_no\": \"WO-BAD-001\",
+        \"machine_no\": \"MC-REL\",
+        \"expected_version\": 1,
+        \"report_ids\": [$HIT]
+      }"
+# 报告编号重复 => 请求级 422
+curl -s -o /dev/null -w "duplicate ids HTTP %{http_code}\n" -X POST "$BASE/releases" \
+  -H 'Content-Type: application/json' \
+  -d "{
+        \"work_order_no\": \"WO-BAD-002\",
+        \"machine_no\": \"MC-REL\",
+        \"expected_version\": 1,
+        \"report_ids\": [$REL_ID1, $REL_ID1]
+      }"
+# 不存在的报告编号 => 404，不留记录
+curl -s -o /dev/null -w "missing report HTTP %{http_code}\n" -X POST "$BASE/releases" \
+  -H 'Content-Type: application/json' \
+  -d "{
+        \"work_order_no\": \"WO-BAD-003\",
+        \"machine_no\": \"MC-REL\",
+        \"expected_version\": 1,
+        \"report_ids\": [99999999]
+      }"
+
+echo "== 37) 修订基线后：旧工单同内容重试仍返回首次结果；新工单按旧版本 => 409 过期 =="
+curl -s -X POST "$BASE/baselines" \
+  -H 'Content-Type: application/json' \
+  -d '{"machine_no": "MC-REL",
+       "zones": [{"zone_no": 1, "version": 2}]}' > /dev/null
+curl -s -X POST "$BASE/releases" \
+  -H 'Content-Type: application/json' \
+  -d "{
+        \"work_order_no\": \"WO-20261007-001\",
+        \"machine_no\": \"MC-REL\",
+        \"expected_version\": 1,
+        \"report_ids\": [$REL_ID2, $REL_ID1]
+      }" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("replay frozen:", d["baseline_version"], d["machine_current_version"], d["report_ids"])'
+curl -s -w "stale new work order HTTP %{http_code}\n" -o /dev/null \
+  -X POST "$BASE/releases" \
+  -H 'Content-Type: application/json' \
+  -d "{
+        \"work_order_no\": \"WO-STALE-001\",
+        \"machine_no\": \"MC-REL\",
+        \"expected_version\": 1,
+        \"report_ids\": [$REL_ID1]
+      }"
+echo "failed work orders leave no records:"
+curl -s "$BASE/releases" | python3 -c 'import sys,json; print([r["work_order_no"] for r in json.load(sys.stdin) if r["work_order_no"].startswith("WO-BAD") or r["work_order_no"]=="WO-STALE-001"])'

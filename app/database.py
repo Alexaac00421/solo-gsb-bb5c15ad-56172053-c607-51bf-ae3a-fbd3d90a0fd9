@@ -13,7 +13,9 @@ DATABASE_URL = os.environ.get(
 
 connect_args: dict = {}
 if DATABASE_URL.startswith("sqlite"):
-    connect_args = {"check_same_thread": False}
+    # check_same_thread：测试与多线程并发用例复用同一引擎；
+    # timeout：同机床基线修订/工单放行串行时，等待写锁最多 15 秒
+    connect_args = {"check_same_thread": False, "timeout": 15}
 
 try:
     engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True,

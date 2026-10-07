@@ -1885,6 +1885,546 @@ class BaselineApiTests(unittest.TestCase):
                          [1, 2, 3, 4, 5, 6])
 
 
+class WorkOrderReleaseTests(unittest.TestCase):
+    """工单刀路审查放行（v1.7）：POST /releases 按工单锁定一台机床的有序
+    无碰撞报告；编号不重复、报告无碰撞、报告固化的基线引用/禁区版本与
+    当前基线一致、预期版本须为当前版本；工单号幂等（同内容重放首次结果，
+    不随后续修订改变；异内容 409）；不合格拒绝且不留部分记录；
+    基线修订与放行并发时判定与记录对应同一版本状态。"""
+
+    @classmethod
+    def setUpClass(cls):
+        # 禁区：800 原点方块；801 远处方块（供 v2 基线引用）
+        client.post("/zones", json={"zone_no": 800, "polygon": SQUARE,
+                                    "z_min": -5, "z_max": 5})
+        client.post("/zones", json={
+            "zone_no": 801,
+            "polygon": [[100, 100], [110, 100], [110, 110], [100, 110]],
+            "z_min": -5, "z_max": 5})
+        # MC-RL v1 = 800v1；后续用例修订出 v2 = 800v1+801v1
+        client.post("/baselines", json={
+            "machine_no": "MC-RL",
+            "zones": [{"zone_no": 800, "version": 1}]})
+        # MC-BAD：基线引用与报告可能错配的机床
+        client.post("/baselines", json={
+            "machine_no": "MC-BAD",
+            "zones": [{"zone_no": 801, "version": 1}]})
+        # MC-FIX：整个用例期间不修订，始终保持 v1（供错配报告等校验类用例）
+        client.post("/baselines", json={
+            "machine_no": "MC-FIX",
+            "zones": [{"zone_no": 800, "version": 1}]})
+        cls.fix_report = client.post("/reviews", json={
+            "baseline": {"machine_no": "MC-FIX", "version": 1},
+            "start": [-5, 50, 0], "tool_radius": 0.0,
+            "gcode": "G1 X15 Y50 Z0\n"}).json()["report_id"]
+        # 基于 MC-FIX v1 的碰撞报告（供放行拒绝类用例）
+        cls.fix_collision = client.post("/reviews", json={
+            "baseline": {"machine_no": "MC-FIX", "version": 1},
+            "start": [-5, 5, 0], "tool_radius": 0.0,
+            "gcode": "G1 X15 Y5 Z0\n"}).json()["report_id"]
+        # 无碰撞报告（基线 MC-RL v1，禁区 800v1）
+        cls.ra = client.post("/reviews", json={
+            "baseline": {"machine_no": "MC-RL", "version": 1},
+            "start": [-5, 50, 0], "tool_radius": 0.0,
+            "gcode": "G1 X15 Y50 Z0\n"}).json()["report_id"]
+        cls.rb = client.post("/reviews", json={
+            "baseline": {"machine_no": "MC-RL", "version": 1},
+            "start": [20, 20, 0], "tool_radius": 0.0,
+            "gcode": "G1 X25 Y25 Z0\n"}).json()["report_id"]
+        # 碰撞报告（同样基于 MC-RL v1）
+        cls.rc = client.post("/reviews", json={
+            "baseline": {"machine_no": "MC-RL", "version": 1},
+            "start": [-5, 5, 0], "tool_radius": 0.0,
+            "gcode": "G1 X15 Y5 Z0\n"}).json()["report_id"]
+        # 直传 zones（无基线引用）的无碰撞报告
+        cls.rd = client.post("/reviews", json={
+            "zones": [{"zone_no": 800, "version": 1}],
+            "start": [-5, 50, 0], "tool_radius": 0.0,
+            "gcode": "G1 X15 Y50 Z0\n"}).json()["report_id"]
+        # 引用另一台机床基线的无碰撞报告
+        cls.re_ = client.post("/reviews", json={
+            "baseline": {"machine_no": "MC-BAD", "version": 1},
+            "start": [-5, 50, 0], "tool_radius": 0.0,
+            "gcode": "G1 X15 Y50 Z0\n"}).json()["report_id"]
+
+    def _release_count(self):
+        return len(client.get("/releases").json())
+
+    def _revise_mc_rl_to_v2(self):
+        r = client.post("/baselines", json={
+            "machine_no": "MC-RL",
+            "zones": [{"zone_no": 800, "version": 1},
+                      {"zone_no": 801, "version": 1}]})
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(r.json()["version"], 2)
+
+    def test_01_first_release_success_and_frozen(self):
+        # 两个有序无碰撞报告（编号顺序故意降序），均基于 MC-RL v1
+        r = client.post("/releases", json={
+            "work_order_no": "WO-01", "machine_no": "MC-RL",
+            "expected_version": 1, "report_ids": [self.rb, self.ra]})
+        self.assertEqual(r.status_code, 201, r.text)
+        body = r.json()
+        self.assertEqual(body["work_order_no"], "WO-01")
+        self.assertEqual(body["machine_no"], "MC-RL")
+        self.assertEqual(body["baseline_version"], 1)
+        # 首次放行时固化版本 = 当时当前版本
+        self.assertEqual(body["machine_current_version"], 1)
+        # 报告顺序按请求固化（不按编号排序）
+        self.assertEqual(body["report_ids"], [self.rb, self.ra])
+        self.assertEqual(body["report_count"], 2)
+        self.assertEqual([it["index"] for it in body["reports"]], [0, 1])
+        self.assertEqual([it["report_id"] for it in body["reports"]],
+                         [self.rb, self.ra])
+        self.assertTrue(all(not it["has_collision"] for it in body["reports"]))
+        self.assertTrue(all(it["used_zone_versions"] == {"800": 1}
+                            for it in body["reports"]))
+        self.assertIn("released_at", body)
+
+    def test_02_get_release_returns_frozen_snapshot(self):
+        r = client.get("/releases/WO-01")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["machine_no"], "MC-RL")
+        self.assertEqual(body["baseline_version"], 1)
+        self.assertEqual(body["report_ids"], [self.rb, self.ra])
+        # 列表可见该工单的概览
+        rows = {x["work_order_no"]: x for x in client.get("/releases").json()}
+        self.assertIn("WO-01", rows)
+        self.assertEqual(rows["WO-01"]["machine_no"], "MC-RL")
+        self.assertEqual(rows["WO-01"]["baseline_version"], 1)
+        self.assertEqual(rows["WO-01"]["report_count"], 2)
+        # 未放行的工单 => 404
+        self.assertEqual(client.get("/releases/WO-NOPE").status_code, 404)
+
+    def test_03_same_content_replay_returns_original(self):
+        payload = {"work_order_no": "WO-01", "machine_no": "MC-RL",
+                   "expected_version": 1, "report_ids": [self.rb, self.ra]}
+        first = client.get("/releases/WO-01").json()
+        r = client.post("/releases", json=payload)
+        # 重放返回 200，内容与首次放行快照逐字段一致
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json(), first)
+
+    def test_04_replay_unaffected_by_later_revision(self):
+        # 修订基线到 v2（当前版本变为 2）
+        self._revise_mc_rl_to_v2()
+        payload = {"work_order_no": "WO-01", "machine_no": "MC-RL",
+                   "expected_version": 1, "report_ids": [self.rb, self.ra]}
+        # 旧工单同内容重试：即使 1 已过期，仍返回首次放行结果（固化版本 1）
+        r = client.post("/releases", json=payload)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["baseline_version"], 1)
+        self.assertEqual(body["machine_current_version"], 1)
+        self.assertEqual(body["report_ids"], [self.rb, self.ra])
+        # 按工单查询同样不随后续修订改变
+        got = client.get("/releases/WO-01").json()
+        self.assertEqual(got, body)
+
+    def test_05_different_content_conflicts(self):
+        # 同工单异内容（报告顺序/集合变化、机床变化、版本变化）=> 409
+        for patch in (
+            {"report_ids": [self.ra, self.rb]},       # 顺序不同
+            {"report_ids": [self.rb]},                # 集合不同
+            {"machine_no": "MC-BAD", "report_ids": [self.re_]},
+            {"expected_version": 2,
+             "report_ids": [self.rb, self.ra]},
+        ):
+            payload = {"work_order_no": "WO-01", "machine_no": "MC-RL",
+                       "expected_version": 1,
+                       "report_ids": [self.rb, self.ra]}
+            payload.update(patch)
+            r = client.post("/releases", json=payload)
+            self.assertEqual(r.status_code, 409, (patch, r.text))
+            self.assertEqual(r.json()["detail"]["error"], "release_conflict")
+        # 异内容但编号重复：请求级 422 先于幂等冲突判定（同样不改动原记录）
+        r = client.post("/releases", json={
+            "work_order_no": "WO-01", "machine_no": "MC-RL",
+            "expected_version": 1,
+            "report_ids": [self.rb, self.ra, self.ra]})
+        self.assertEqual(r.status_code, 422)
+        # 原放行结果不变
+        body = client.get("/releases/WO-01").json()
+        self.assertEqual(body["report_ids"], [self.rb, self.ra])
+        self.assertEqual(body["baseline_version"], 1)
+
+    def test_06_stale_version_rejected_for_new_work_order(self):
+        before = self._release_count()
+        # 当前已为 v2（test_04 修订）：新工单用过期版本 1 => 409
+        r = client.post("/releases", json={
+            "work_order_no": "WO-STALE", "machine_no": "MC-RL",
+            "expected_version": 1, "report_ids": [self.ra]})
+        self.assertEqual(r.status_code, 409, r.text)
+        detail = r.json()["detail"]
+        self.assertEqual(detail["error"], "baseline_version_stale")
+        self.assertEqual(detail["expected_version"], 1)
+        self.assertEqual(detail["current_version"], 2)
+        # 不留记录
+        self.assertEqual(client.get("/releases/WO-STALE").status_code, 404)
+        self.assertEqual(self._release_count(), before)
+
+    def test_07_baseline_not_found(self):
+        # 机床从无基线 => 404
+        r = client.post("/releases", json={
+            "work_order_no": "WO-MISS1", "machine_no": "MC-NONE",
+            "expected_version": 1, "report_ids": [self.ra]})
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["detail"]["error"], "baseline_not_found")
+        # 机床存在但版本号不存在 => 404
+        r = client.post("/releases", json={
+            "work_order_no": "WO-MISS2", "machine_no": "MC-RL",
+            "expected_version": 99, "report_ids": [self.ra]})
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["detail"]["error"], "baseline_not_found")
+        self.assertEqual(client.get("/releases/WO-MISS1").status_code, 404)
+        self.assertEqual(client.get("/releases/WO-MISS2").status_code, 404)
+
+    def test_08_report_not_found_no_partial_record(self):
+        before = self._release_count()
+        missing_id = 10_000_000
+        # 全部不存在 / 部分不存在：均 404，不留任何放行记录
+        r = client.post("/releases", json={
+            "work_order_no": "WO-RNF1", "machine_no": "MC-RL",
+            "expected_version": 2,
+            "report_ids": [missing_id, self.ra]})
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["detail"]["error"],
+                         "release_report_not_found")
+        r = client.post("/releases", json={
+            "work_order_no": "WO-RNF2", "machine_no": "MC-RL",
+            "expected_version": 2, "report_ids": [missing_id]})
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(self._release_count(), before)
+        self.assertEqual(client.get("/releases/WO-RNF1").status_code, 404)
+        self.assertEqual(client.get("/releases/WO-RNF2").status_code, 404)
+
+    def test_09_collision_report_rejected(self):
+        before = self._release_count()
+        # 含碰撞报告（即使其他报告合格）=> 422，指明位置与报告编号
+        r = client.post("/releases", json={
+            "work_order_no": "WO-COLL", "machine_no": "MC-FIX",
+            "expected_version": 1,
+            "report_ids": [self.fix_report, self.fix_collision]})
+        self.assertEqual(r.status_code, 422, r.text)
+        detail = r.json()["detail"]
+        self.assertEqual(detail["error"], "release_report_has_collision")
+        self.assertEqual(detail["index"], 1)
+        self.assertEqual(detail["report_id"], self.fix_collision)
+        self.assertIsNotNone(detail["collision_line_no"])
+        self.assertEqual(detail["collision_zone_no"], 800)
+        # 单独放碰撞报告同样拒绝
+        r = client.post("/releases", json={
+            "work_order_no": "WO-COLL2", "machine_no": "MC-FIX",
+            "expected_version": 1, "report_ids": [self.fix_collision]})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(self._release_count(), before)
+        self.assertEqual(client.get("/releases/WO-COLL").status_code, 404)
+
+    def test_10_report_baseline_reference_mismatch(self):
+        before = self._release_count()
+        # 直传 zones 的报告（input_summary 无 baseline）=> 基线引用不一致
+        r = client.post("/releases", json={
+            "work_order_no": "WO-REF1", "machine_no": "MC-FIX",
+            "expected_version": 1,
+            "report_ids": [self.fix_report, self.rd]})
+        self.assertEqual(r.status_code, 422)
+        detail = r.json()["detail"]
+        self.assertEqual(detail["error"], "release_report_baseline_mismatch")
+        self.assertEqual(detail["index"], 1)
+        self.assertEqual(detail["report_id"], self.rd)
+        self.assertIsNone(detail["report_baseline"])
+        # 引用另一台机床基线的报告 => 机床不一致
+        r = client.post("/releases", json={
+            "work_order_no": "WO-REF2", "machine_no": "MC-FIX",
+            "expected_version": 1, "report_ids": [self.re_]})
+        self.assertEqual(r.status_code, 422)
+        detail = r.json()["detail"]
+        self.assertEqual(detail["error"], "release_report_baseline_mismatch")
+        self.assertEqual(detail["report_baseline"],
+                         {"machine_no": "MC-BAD", "version": 1})
+        # 反向：MC-FIX 的报告放到 MC-BAD 机床上放行也拒绝
+        r = client.post("/releases", json={
+            "work_order_no": "WO-REF3", "machine_no": "MC-BAD",
+            "expected_version": 1, "report_ids": [self.fix_report]})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["detail"]["error"],
+                         "release_report_baseline_mismatch")
+        self.assertEqual(self._release_count(), before)
+
+    def test_11_zone_versions_must_match_baseline_list(self):
+        # 防御性校验：直接写一条「基线引用是 MC-RL v1 但固化禁区版本
+        # 与 v1 清单不符」的报告（正常 API 无法产生），放行必须拒绝
+        from app.database import SessionLocal
+        from app.models import Report
+        db = SessionLocal()
+        try:
+            tampered = Report(
+                zone_versions={"800": 1, "801": 1},
+                input_summary={"baseline": {"machine_no": "MC-FIX",
+                                            "version": 1}},
+                has_collision=False, conclusion="no_collision")
+            db.add(tampered)
+            db.commit()
+            db.refresh(tampered)
+            tampered_id = tampered.id
+        finally:
+            db.close()
+        before = self._release_count()
+        r = client.post("/releases", json={
+            "work_order_no": "WO-ZV", "machine_no": "MC-FIX",
+            "expected_version": 1, "report_ids": [tampered_id]})
+        self.assertEqual(r.status_code, 422)
+        detail = r.json()["detail"]
+        self.assertEqual(detail["error"],
+                         "release_report_zone_versions_mismatch")
+        self.assertEqual(detail["expected_zone_versions"], {"800": 1})
+        self.assertEqual(detail["report_zone_versions"],
+                         {"800": 1, "801": 1})
+        self.assertEqual(self._release_count(), before)
+        self.assertEqual(client.get("/releases/WO-ZV").status_code, 404)
+
+    def test_12_request_validation(self):
+        base = {"work_order_no": "WO-VAL", "machine_no": "MC-FIX",
+                "expected_version": 1, "report_ids": [self.fix_report]}
+        # 空报告列表 / 超过 50 个 / 重复编号 => 422（不进入业务校验）
+        r = client.post("/releases", json={**base, "report_ids": []})
+        self.assertEqual(r.status_code, 422)
+        r = client.post("/releases", json={
+            **base, "report_ids": [self.ra] * 51})
+        self.assertEqual(r.status_code, 422)
+        r = client.post("/releases", json={
+            **base, "report_ids": [self.ra, self.ra]})
+        self.assertEqual(r.status_code, 422)
+        # 非法工单/机床编号、非正版本/报告编号 => 422
+        r = client.post("/releases", json={**base, "work_order_no": "bad id!"})
+        self.assertEqual(r.status_code, 422)
+        r = client.post("/releases", json={**base, "machine_no": "bad id!"})
+        self.assertEqual(r.status_code, 422)
+        r = client.post("/releases", json={**base, "expected_version": 0})
+        self.assertEqual(r.status_code, 422)
+        r = client.post("/releases", json={
+            **base, "report_ids": [0]})
+        self.assertEqual(r.status_code, 422)
+        # 非法请求均无对应工单记录
+        self.assertEqual(client.get("/releases/WO-VAL").status_code, 404)
+
+    def test_13_current_version_release_success_and_order_frozen(self):
+        # 当前版本 v2（test_04 修订）：按 v2 放新工单，报告均须基于 v2
+        def make_v2_report(gcode):
+            rr = client.post("/reviews", json={
+                "baseline": {"machine_no": "MC-RL", "version": 2},
+                "start": [-5, 50, 0], "tool_radius": 0.0, "gcode": gcode})
+            self.assertEqual(rr.status_code, 200, rr.text)
+            self.assertEqual(rr.json()["used_zone_versions"],
+                             {"800": 1, "801": 1})
+            return rr.json()["report_id"]
+
+        rid2 = make_v2_report("G1 X15 Y50 Z0\n")
+        rid3 = make_v2_report("G1 X25 Y50 Z0\n")
+        # 编号重复 => 422（不进入业务校验，不建工单）
+        r = client.post("/releases", json={
+            "work_order_no": "WO-CUR", "machine_no": "MC-RL",
+            "expected_version": 2, "report_ids": [rid2, rid3, rid2]})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(client.get("/releases/WO-CUR").status_code, 404)
+        # 顺序故意降序：按请求顺序固化，不按编号排序
+        r = client.post("/releases", json={
+            "work_order_no": "WO-CUR", "machine_no": "MC-RL",
+            "expected_version": 2, "report_ids": [rid3, rid2]})
+        self.assertEqual(r.status_code, 201, r.text)
+        body = r.json()
+        self.assertEqual(body["baseline_version"], 2)
+        self.assertEqual(body["machine_current_version"], 2)
+        self.assertEqual(body["report_ids"], [rid3, rid2])
+        self.assertEqual([it["report_id"] for it in body["reports"]],
+                         [rid3, rid2])
+        self.assertTrue(all(not it["has_collision"] for it in body["reports"]))
+        self.assertEqual([it["used_zone_versions"] for it in body["reports"]],
+                         [{"800": 1, "801": 1}] * 2)
+
+    def test_14_release_and_revision_concurrent_same_version_state(self):
+        import threading
+        from sqlalchemy import text as _text
+        from app.database import SessionLocal
+
+        # 专用机床：MC-LOCK v1
+        client.post("/baselines", json={
+            "machine_no": "MC-LOCK",
+            "zones": [{"zone_no": 800, "version": 1}]})
+        r = client.post("/reviews", json={
+            "baseline": {"machine_no": "MC-LOCK", "version": 1},
+            "start": [-5, 50, 0], "tool_radius": 0.0,
+            "gcode": "G1 X15 Y50 Z0\n"})
+        self.assertEqual(r.status_code, 200, r.text)
+        lock_report = r.json()["report_id"]
+
+        outcome = {}
+        started = threading.Event()
+        release_entered = threading.Event()
+
+        def blocker_revision():
+            # 独立连接：取得机床锁后保持事务打开（不提交），模拟并发修订
+            # 进行中；最后回滚 => 不产生新版本
+            db = SessionLocal()
+            try:
+                db.begin()
+                db.execute(_text(
+                    "INSERT OR IGNORE INTO machine_locks (machine_no, "
+                    "created_at) VALUES ('MC-LOCK', CURRENT_TIMESTAMP)"))
+                db.execute(_text(
+                    "UPDATE machine_locks SET machine_no = machine_no "
+                    "WHERE machine_no = 'MC-LOCK'"))
+                started.set()
+                # 等待放行请求抵达并阻塞在锁上
+                release_entered.wait(timeout=10)
+                import time
+                time.sleep(0.3)
+                db.rollback()
+            except Exception as exc:  # pragma: no cover - 仅诊断用
+                outcome["blocker_error"] = repr(exc)
+                db.rollback()
+            finally:
+                db.close()
+
+        def release_call():
+            # 等待修订先持锁，再发起放行（应排队等待同一把机床锁）
+            started.wait(timeout=10)
+            outcome["release_entered"] = True
+            release_entered.set()
+            c2 = TestClient(app)
+            resp = c2.post("/releases", json={
+                "work_order_no": "WO-LOCK", "machine_no": "MC-LOCK",
+                "expected_version": 1, "report_ids": [lock_report]})
+            outcome["release_status"] = resp.status_code
+            outcome["release_body"] = resp.json()
+
+        t1 = threading.Thread(target=blocker_revision)
+        t2 = threading.Thread(target=release_call)
+        t1.start()
+        t2.start()
+        t2.join(timeout=20)
+        t1.join(timeout=20)
+        self.assertNotIn("blocker_error", outcome)
+        # 修订最终回滚（未产生 v2）=> 持锁期间放行无法读到「当前版本已推进」，
+        # 锁释放后按同一版本状态（仍为 v1）判定放行成功
+        self.assertEqual(outcome.get("release_status"), 201, outcome)
+        self.assertEqual(outcome["release_body"]["baseline_version"], 1)
+        self.assertEqual(outcome["release_body"]["machine_current_version"], 1)
+
+        # 确定性交错：放行事务持锁期间提交修订必须等待；放行提交（固化 v1）
+        # 后锁释放，修订才推进到 v2，随后新工单按旧版本即被判定过期
+        from app import main as mainmod
+        holder = SessionLocal()
+        holder.begin()
+        try:
+            mainmod._acquire_machine_lock(holder, "MC-LOCK")
+
+            # 在另一连接发起修订：校验读取完成后排队等待同一把机床锁
+            rev_result = {}
+
+            def revise():
+                c2 = TestClient(app)
+                resp = c2.post("/baselines", json={
+                    "machine_no": "MC-LOCK",
+                    "zones": [{"zone_no": 801, "version": 1}]})
+                rev_result["status"] = resp.status_code
+                rev_result["body"] = resp.json()
+
+            tr = threading.Thread(target=revise)
+            tr.start()
+            import time
+            time.sleep(0.5)
+            # 修订仍被锁阻塞（未产生 v2）
+            self.assertNotIn("status", rev_result)
+            self.assertEqual(
+                holder.query(__import__(
+                    "app.models", fromlist=["ZoneBaseline"]).ZoneBaseline)
+                .filter_by(machine_no="MC-LOCK").count(), 1)
+
+            # 持锁的放行事务完成：固化 WO-LOCK2 于 v1（当时仍为当前版本）
+            from app.models import WorkOrderRelease
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            snapshot = {"work_order_no": "WO-LOCK2", "machine_no": "MC-LOCK",
+                        "baseline_version": 1, "machine_current_version": 1,
+                        "report_ids": [lock_report], "report_count": 1,
+                        "reports": [{"index": 0, "report_id": lock_report,
+                                     "has_collision": False,
+                                     "used_zone_versions": {"800": 1}}],
+                        "released_at": now.isoformat()}
+            holder.add(WorkOrderRelease(
+                work_order_no="WO-LOCK2", content_hash="x" * 64,
+                machine_no="MC-LOCK", baseline_version=1,
+                machine_current_version=1, report_ids=[lock_report],
+                report_count=1, result=snapshot, released_at=now))
+            holder.commit()  # 释放锁，排队的修订得以完成 => v2
+        finally:
+            holder.close()
+        tr.join(timeout=20)
+        self.assertEqual(rev_result.get("status"), 201, rev_result)
+        self.assertEqual(rev_result["body"]["version"], 2)
+        # 刚放行的 WO-LOCK2 固化在 v1，查询不受修订影响
+        got = client.get("/releases/WO-LOCK2").json()
+        self.assertEqual(got["baseline_version"], 1)
+        self.assertEqual(got["machine_current_version"], 1)
+        # 版本已推进：新工单再按 v1 放行 => 过期拒绝
+        r = client.post("/releases", json={
+            "work_order_no": "WO-LOCK3", "machine_no": "MC-LOCK",
+            "expected_version": 1, "report_ids": [lock_report]})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["detail"]["error"],
+                         "baseline_version_stale")
+        self.assertEqual(r.json()["detail"]["current_version"], 2)
+        self.assertEqual(client.get("/releases/WO-LOCK3").status_code, 404)
+
+    def test_15_concurrent_same_work_order_single_winner(self):
+        import threading
+        client.post("/baselines", json={
+            "machine_no": "MC-CCR",
+            "zones": [{"zone_no": 800, "version": 1}]})
+        rid = client.post("/reviews", json={
+            "baseline": {"machine_no": "MC-CCR", "version": 1},
+            "start": [-5, 50, 0], "tool_radius": 0.0,
+            "gcode": "G1 X15 Y50 Z0\n"}).json()["report_id"]
+        statuses: list[int] = []
+
+        def worker():
+            c2 = TestClient(app)
+            resp = c2.post("/releases", json={
+                "work_order_no": "WO-CCR", "machine_no": "MC-CCR",
+                "expected_version": 1, "report_ids": [rid]})
+            statuses.append(resp.status_code)
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # 一个 201（首次），其余 200（同内容重放）；仅有一条记录
+        self.assertEqual(sorted(statuses), [200, 200, 200, 200, 201])
+        rows = [x for x in client.get("/releases").json()
+                if x["work_order_no"] == "WO-CCR"]
+        self.assertEqual(len(rows), 1)
+
+    def test_16_rejection_leaves_no_partial_record_under_revision(self):
+        # 基线存在但报告不合格时即使机床锁路径也完整回滚：
+        # 失败后基线可立即继续修订（证明无锁/无行残留）
+        before = self._release_count()
+        r = client.post("/releases", json={
+            "work_order_no": "WO-PART", "machine_no": "MC-LOCK",
+            "expected_version": 2, "report_ids": [self.rc]})
+        self.assertEqual(r.status_code, 422)  # 碰撞报告
+        self.assertEqual(self._release_count(), before)
+        # 紧接修订同一机床不被阻塞（回滚已释放锁）
+        r = client.post("/baselines", json={
+            "machine_no": "MC-LOCK",
+            "zones": [{"zone_no": 800, "version": 1}]})
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(r.json()["version"], 3)
+        self.assertEqual(client.get("/releases/WO-PART").status_code, 404)
+
+
 class SchemaMigrationTests(unittest.TestCase):
     """旧库（缺少 v1.1/v1.2/v1.3 新列）启动时幂等补齐，旧报告读取兼容。"""
 

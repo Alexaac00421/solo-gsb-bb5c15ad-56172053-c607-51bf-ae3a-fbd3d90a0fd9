@@ -7,7 +7,11 @@
 - reports：审查报告，创建后不可变，不随后续禁区版本变化；
 - batches：批量审查批次（batch_id 幂等键 + 内容哈希 + 逐项结果快照）；
 - upload_sessions / upload_chunks：长 G-code 可恢复分块上传会话及其文本块，
-  全部状态落库，跨服务重启保留。
+  全部状态落库，跨服务重启保留；
+- machine_locks：按机床编号的串行锁，基线修订与工单放行取同一把锁，
+  保证放行判定与放行记录对应同一基线版本状态；
+- work_order_releases：工单刀路审查放行（工单号幂等键 + 内容哈希 +
+  机床/基线版本/有序报告编号 + 完整结果快照），放行后不可变。
 """
 from __future__ import annotations
 
@@ -197,3 +201,56 @@ class UploadChunk(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
     session = relationship("UploadSession", back_populates="chunks")
+
+
+class MachineLock(Base):
+    """按机床编号的串行锁表（v1.7）。
+
+    每个机床编号一行；基线修订（POST /baselines）与工单放行
+    （POST /releases）在读取/推进该机床基线当前版本前先取这把锁，
+    使「基线修订」与「放行判定 + 放行记录」对同一机床严格串行：
+    放行事务在锁内确认预期版本仍是当前版本并完成固化，期间基线无法
+    修订插入新版本，判定与记录必然对应同一版本状态。
+    """
+
+    __tablename__ = "machine_locks"
+
+    id = Column(Integer, primary_key=True)
+    machine_no = Column(String(64), nullable=False, unique=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
+class WorkOrderRelease(Base):
+    """工单刀路审查放行（v1.7）：车间按工单锁定一台机床的放行结果。
+
+    work_order_no 为幂等键（唯一约束兜底并发）；content_hash 为放行内容
+    （机床编号、预期基线版本、有序报告编号）规范化后的 SHA-256，
+    用于区分重放与冲突：
+    相同工单 + 相同内容 => 重放首次放行结果（result 快照原样返回），
+    即使该机床基线后续已修订；相同工单 + 不同内容 => 409，不新增行。
+
+    成功放行时固化工单号、机床编号、基线版本、按输入顺序的报告编号
+    （report_ids）、放行时该机床当前版本（machine_current_version，应等于
+    固化基线版本）与放行时间（released_at）；result 为完整响应快照，
+    按工单查询永远返回该快照，不随后续基线/禁区修订改变。
+    """
+
+    __tablename__ = "work_order_releases"
+
+    id = Column(Integer, primary_key=True)
+    work_order_no = Column(String(64), nullable=False, unique=True)
+    # 放行内容（机床编号 + 预期基线版本 + 有序报告编号）的 SHA-256
+    content_hash = Column(String(64), nullable=False)
+    machine_no = Column(String(64), nullable=False)
+    # 放行时固化的机床基线版本（= 请求的预期版本）
+    baseline_version = Column(Integer, nullable=False)
+    # 放行时刻该机床当前（最大）基线版本；首次放行时与 baseline_version 相同
+    machine_current_version = Column(Integer, nullable=False)
+    # 按输入顺序固化的报告编号（1～50 个，互不重复）
+    report_ids = Column(JSON, nullable=False)
+    report_count = Column(Integer, nullable=False)
+    # 首次放行完整响应快照（ReleaseResponse JSON，重放原样返回）
+    result = Column(JSON, nullable=False)
+    released_at = Column(DateTime(timezone=True), nullable=False,
+                         default=_utcnow)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)

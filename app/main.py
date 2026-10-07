@@ -19,20 +19,22 @@ from .database import Base, engine, get_db
 from .gcode import GCodeError, parse_gcode
 from .geometry import GeometryError, normalize_polygon, validate_z_range
 from . import models
-from .models import (Batch, Report, UploadChunk, UploadSession, ZoneBaseline,
-                     ZoneVersion)
+from .models import (Batch, MachineLock, Report, UploadChunk, UploadSession,
+                     WorkOrderRelease, ZoneBaseline, ZoneVersion)
 from .schemas import (MAX_CHUNK_BYTES, MAX_CHUNK_COUNT, MAX_TOTAL_BYTES,
                       BaselineCreate, BaselineDetailOut, BaselineOut,
                       BaselineSummaryOut, BatchItemResult, BatchReviewRequest,
                       BatchReviewResponse, ChunkReceipt, MinClearanceOut,
-                      ReviewRequest, ReviewResponse, TraceEventOut,
-                      UploadCompleteRequest, UploadSessionCreate,
-                      UploadSessionOut, ZoneCreate, ZoneDetailOut, ZoneOut,
-                      ZoneRef, ZoneVersionCreate, ZoneVersionOut)
+                      ReleaseCreate, ReleaseOut, ReleaseReportItem,
+                      ReleaseSummaryOut, ReviewRequest, ReviewResponse,
+                      TraceEventOut, UploadCompleteRequest,
+                      UploadSessionCreate, UploadSessionOut, ZoneCreate,
+                      ZoneDetailOut, ZoneOut, ZoneRef, ZoneVersionCreate,
+                      ZoneVersionOut)
 
 app = FastAPI(
     title="数控刀路禁入区审查服务",
-    version="1.6.0",
+    version="1.7.0",
     description="登记毫米制二维多边形禁区（含闭合 Z 高度范围、不可变版本），"
                 "对 G-code 刀路做连续碰撞审查并出具不可变报告；"
                 "可选计算全程最小水平净间隙（include_min_clearance），"
@@ -46,7 +48,10 @@ app = FastAPI(
                 "支持机床禁区基线（/baselines：按机床编号固化一组禁区编号+"
                 "明确版本，首版为 1，修订产生递增不可变新版本；单项审查、"
                 "批量任务与分块上传建会话可用 机床编号+基线版本 代替 zones，"
-                "审查时解析为对应禁区版本快照）。",
+                "审查时解析为对应禁区版本快照）；"
+                "支持工单刀路审查放行（/releases：按工单锁定一台机床的有序"
+                "无碰撞报告，校验报告基线引用与禁区版本与当前基线一致，"
+                "工单号幂等，放行结果固化后不随后续修订改变）。",
 )
 
 
@@ -54,7 +59,8 @@ app = FastAPI(
 def on_startup() -> None:
     # 容器内由应用直接完成数据库初始化（表结构创建；v1.4 新增 batches 表、
     # v1.5 新增 upload_sessions / upload_chunks 表、v1.6 新增 zone_baselines
-    # 机床基线表，对旧库同样由 create_all 幂等建出）
+    # 机床基线表、v1.7 新增 machine_locks / work_order_releases 表，
+    # 对旧库同样由 create_all 幂等建出）
     Base.metadata.create_all(bind=engine)
     # 旧库 reports 表缺少后续版本新增列：幂等补齐，保证旧请求/旧报告仍可读写
     _ensure_report_columns(engine)
@@ -97,6 +103,38 @@ def _ensure_report_columns(db_engine) -> None:
 async def geometry_error_handler(request: Request, exc: GeometryError):  # noqa: ARG001
     return JSONResponse(status_code=422,
                         content={"error": "invalid_geometry", "detail": str(exc)})
+
+
+# ---------- 按机床编号的串行锁 ----------
+#
+# 基线修订（POST /baselines）推进某机床的当前基线版本；工单放行
+# （POST /releases）要求「预期版本必须仍是当前版本」且判定与记录对应同一
+# 版本状态。两者在涉及同一机床的版本推进/读取前先取 machine_locks 中
+# 该机床行锁，使同机床「修订」与「放行」严格串行：
+# - PostgreSQL：行级锁 SELECT ... FOR UPDATE，并发同机床事务排队；
+# - SQLite：INSERT/UPDATE 即取得 RESERVED 写锁（配合 busy_timeout），
+#   写事务整体串行；锁行存在性同时由唯一约束兜底。
+
+def _acquire_machine_lock(db: Session, machine_no: str) -> None:
+    """取得某机床编号的串行锁（事务内；提交/回滚后释放）。"""
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        # 幂等确保锁行存在，再锁定该行
+        db.execute(text(
+            "INSERT INTO machine_locks (machine_no, created_at) "
+            "VALUES (:m, now()) ON CONFLICT (machine_no) DO NOTHING"),
+            {"m": machine_no})
+        db.execute(text(
+            "SELECT 1 FROM machine_locks WHERE machine_no = :m "
+            "FOR UPDATE"), {"m": machine_no})
+    else:
+        # SQLite：INSERT OR IGNORE 取得 RESERVED 锁；UPDATE 保证调用方
+        # 在锁行已存在（由先前事务创建）时同样进入写事务并排队
+        db.execute(text(
+            "INSERT OR IGNORE INTO machine_locks (machine_no, created_at) "
+            "VALUES (:m, CURRENT_TIMESTAMP)"), {"m": machine_no})
+        db.execute(text(
+            "UPDATE machine_locks SET machine_no = machine_no "
+            "WHERE machine_no = :m"), {"m": machine_no})
 
 
 # ---------- 禁区登记 ----------
@@ -218,10 +256,13 @@ def create_baseline(payload: BaselineCreate,
     _load_zones(db, refs)
     frozen = [{"zone_no": r.zone_no, "version": r.version} for r in refs]
 
-    # 版本号 = 该机床当前最大版本 + 1（首版为 1）；(machine_no, version)
-    # 唯一约束兜底并发修订：冲突即重读最新版本重试，并发提交各获不同版本，
-    # 不丢失任何已成功提交的版本
+    # 版本号 = 该机床当前最大版本 + 1（首版为 1）。版本推进在该机床的
+    # 串行锁内进行，与工单放行（POST /releases）互斥：放行事务不会读到
+    # 「已确认当前、提交前却被修订插入新版本」的中间状态；
+    # (machine_no, version) 唯一约束兜底并发修订：冲突即回滚（释放锁）
+    # 后重读最新版本重试，并发提交各获不同版本，不丢失任何已成功提交的版本
     for _ in range(10):
+        _acquire_machine_lock(db, payload.machine_no)
         latest = db.scalar(select(func.max(ZoneBaseline.version)).where(
             ZoneBaseline.machine_no == payload.machine_no)) or 0
         baseline = ZoneBaseline(machine_no=payload.machine_no,
@@ -282,6 +323,224 @@ def get_baseline_version(machine_no: str, version: int,
             status_code=404,
             detail=f"机床 {machine_no!r} 不存在基线版本 {version}")
     return _baseline_out(b)
+
+
+# ---------- 工单刀路审查放行 ----------
+#
+# 车间按工单为一台机床的一组有序、已完成的无碰撞审查报告办理放行：
+# POST /releases 提交 工单号（幂等键）+ 机床编号 + 预期基线版本 +
+# 1～50 个有序且互不重复的报告编号。仅当：
+#   1) 该机床存在预期基线版本；
+#   2) 预期版本仍是该机床当前（最大）版本（首次放行）；
+#   3) 全部报告存在、均无碰撞，且固化的基线引用（机床+版本）与
+#      used_zone_versions 与该基线版本固化的禁区清单完全一致；
+# 才在该机床串行锁内同事务固化工单、报告顺序、基线版本与放行时间。
+# 与基线修订共用同一把机床锁 => 判定与记录对应同一版本状态。
+# 成功后按工单查询（GET /releases/{work_order_no}）永远返回首次放行快照，
+# 不随后续基线修订改变；相同工单+相同内容重试（即使基线已修订）原样
+# 返回首次结果；相同工单+不同内容 409 冲突。任何不合格均拒绝且不留
+# 部分记录。
+
+
+def _release_content_hash(payload: ReleaseCreate) -> str:
+    """放行内容（机床+预期版本+有序报告编号；含工单号）的 SHA-256。"""
+    canonical = json.dumps(
+        {"work_order_no": payload.work_order_no,
+         "machine_no": payload.machine_no,
+         "expected_version": payload.expected_version,
+         "report_ids": list(payload.report_ids)},
+        sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _release_replay(row: WorkOrderRelease) -> JSONResponse:
+    """重放：原样返回首次放行的固化响应快照（200）。"""
+    return JSONResponse(status_code=200, content=row.result)
+
+
+def _release_conflict(payload: ReleaseCreate) -> HTTPException:
+    return HTTPException(status_code=409, detail={
+        "error": "release_conflict",
+        "work_order_no": payload.work_order_no,
+        "message": f"工单 {payload.work_order_no!r} 已放行且内容不同，"
+                   "未生成新放行记录"})
+
+
+def _release_out_from_row(row: WorkOrderRelease) -> ReleaseOut:
+    return ReleaseOut(**row.result)
+
+
+@app.post("/releases", response_model=ReleaseOut, status_code=201,
+          summary="工单刀路审查放行（工单号幂等；锁定机床基线版本与有序报告）")
+def create_release(payload: ReleaseCreate,
+                   db: Session = Depends(get_db)):
+    content_hash = _release_content_hash(payload)
+
+    # 幂等快路径：工单已放行 => 同内容重放首次快照（不随后续基线修订改变），
+    # 异内容冲突；无需进入机床锁
+    existing = db.scalar(select(WorkOrderRelease).where(
+        WorkOrderRelease.work_order_no == payload.work_order_no))
+    if existing is not None:
+        if existing.content_hash != content_hash:
+            raise _release_conflict(payload)
+        return _release_replay(existing)
+
+    # 与基线修订共用该机床串行锁：锁内「当前版本确认 + 报告校验 + 固化」
+    # 为一个不可分割的版本状态视图，修订无法在提交前插入新版本
+    _acquire_machine_lock(db, payload.machine_no)
+
+    # 并发同工单：锁内再判一次（唯一约束之外的应用层判定）
+    existing = db.scalar(select(WorkOrderRelease).where(
+        WorkOrderRelease.work_order_no == payload.work_order_no))
+    if existing is not None:
+        if existing.content_hash != content_hash:
+            raise _release_conflict(payload)
+        return _release_replay(existing)
+
+    # 1) 预期基线版本必须存在
+    baseline = db.scalar(select(ZoneBaseline).where(
+        ZoneBaseline.machine_no == payload.machine_no,
+        ZoneBaseline.version == payload.expected_version))
+    if baseline is None:
+        # 区分「机床从未有基线/该版本不存在」与「版本过期」：
+        # 任意基线都不存在时按不存在拒绝
+        raise HTTPException(status_code=404, detail={
+            "error": "baseline_not_found",
+            "machine_no": payload.machine_no,
+            "baseline_version": payload.expected_version,
+            "message": f"机床 {payload.machine_no!r} 不存在基线版本 "
+                       f"{payload.expected_version}，拒绝放行"})
+
+    # 2) 预期版本必须仍是该机床当前（最大）版本：版本过期拒绝
+    current_version = db.scalar(select(func.max(ZoneBaseline.version)).where(
+        ZoneBaseline.machine_no == payload.machine_no)) or 0
+    if current_version != payload.expected_version:
+        raise HTTPException(status_code=409, detail={
+            "error": "baseline_version_stale",
+            "machine_no": payload.machine_no,
+            "expected_version": payload.expected_version,
+            "current_version": current_version,
+            "message": f"预期基线版本 {payload.expected_version} 已不是机床 "
+                       f"{payload.machine_no!r} 的当前版本（当前为 "
+                       f"{current_version}），拒绝放行"})
+
+    # 基线版本固化的禁区编号+明确版本清单（报告须与其完全一致）
+    expected_used = {str(z["zone_no"]): z["version"] for z in baseline.zones}
+    expected_baseline_ref = {"machine_no": payload.machine_no,
+                             "version": payload.expected_version}
+
+    # 3) 报告须全部存在，并按输入顺序保持有序
+    reports: list[Report] = []
+    for rid in payload.report_ids:
+        report = db.get(Report, rid)
+        if report is None:
+            raise HTTPException(status_code=404, detail={
+                "error": "release_report_not_found",
+                "report_id": rid,
+                "message": f"报告 {rid} 不存在，拒绝放行"})
+        reports.append(report)
+
+    # 4) 每份报告：无碰撞；固化的基线引用与机床、版本一致；
+    #    固化的 used_zone_versions 与该基线清单完全一致
+    report_items: list[ReleaseReportItem] = []
+    for index, (rid, report) in enumerate(
+            zip(payload.report_ids, reports, strict=True)):
+        if report.has_collision:
+            raise HTTPException(status_code=422, detail={
+                "error": "release_report_has_collision",
+                "index": index, "report_id": rid,
+                "collision_line_no": report.collision_line_no,
+                "collision_zone_no": report.collision_zone_no,
+                "message": f"报告 {rid} 存在碰撞（第 "
+                           f"{report.collision_line_no} 行，禁区 "
+                           f"{report.collision_zone_no}），拒绝放行"})
+        summary = report.input_summary if isinstance(
+            report.input_summary, dict) else {}
+        report_ref = summary.get("baseline")
+        if report_ref != expected_baseline_ref:
+            raise HTTPException(status_code=422, detail={
+                "error": "release_report_baseline_mismatch",
+                "index": index, "report_id": rid,
+                "expected_baseline": expected_baseline_ref,
+                "report_baseline": report_ref,
+                "message": f"报告 {rid} 固化的基线引用与机床 "
+                           f"{payload.machine_no!r} 基线版本 "
+                           f"{payload.expected_version} 不一致，拒绝放行"})
+        used = report.zone_versions if isinstance(
+            report.zone_versions, dict) else {}
+        # JSON 键为字符串，按相同口径比较；键集合与各自版本都须一致
+        if {str(k): v for k, v in used.items()} != expected_used:
+            raise HTTPException(status_code=422, detail={
+                "error": "release_report_zone_versions_mismatch",
+                "index": index, "report_id": rid,
+                "expected_zone_versions": expected_used,
+                "report_zone_versions": used,
+                "message": f"报告 {rid} 固化的禁区版本与基线版本 "
+                           f"{payload.expected_version} 清单不一致，拒绝放行"})
+        report_items.append(ReleaseReportItem(
+            index=index, report_id=rid, has_collision=False,
+            used_zone_versions={str(k): v for k, v in used.items()}))
+
+    # 全部合格：在同一事务固化工单、报告顺序、基线版本与放行时间
+    released_at = datetime.now(timezone.utc)
+    out = ReleaseOut(
+        work_order_no=payload.work_order_no,
+        machine_no=payload.machine_no,
+        baseline_version=payload.expected_version,
+        machine_current_version=current_version,
+        report_ids=list(payload.report_ids),
+        report_count=len(payload.report_ids),
+        reports=report_items,
+        released_at=released_at)
+    row = WorkOrderRelease(
+        work_order_no=payload.work_order_no, content_hash=content_hash,
+        machine_no=payload.machine_no,
+        baseline_version=payload.expected_version,
+        machine_current_version=current_version,
+        report_ids=list(payload.report_ids),
+        report_count=len(payload.report_ids),
+        result=out.model_dump(mode="json"), released_at=released_at)
+    db.add(row)
+    try:
+        db.commit()
+    except IntegrityError:
+        # 并发同工单首次提交：唯一约束兜底，重放已入库的首次结果
+        db.rollback()
+        winner = db.scalar(select(WorkOrderRelease).where(
+            WorkOrderRelease.work_order_no == payload.work_order_no))
+        if winner is not None and winner.content_hash == content_hash:
+            return _release_replay(winner)
+        raise _release_conflict(payload)
+    return out
+
+
+@app.get("/releases", response_model=list[ReleaseSummaryOut],
+         summary="列出全部工单放行（按放行时间升序）")
+def list_releases(db: Session = Depends(get_db)) -> list[ReleaseSummaryOut]:
+    rows = db.scalars(select(WorkOrderRelease)
+                      .order_by(WorkOrderRelease.released_at,
+                                WorkOrderRelease.work_order_no)).all()
+    return [ReleaseSummaryOut(
+        work_order_no=r.work_order_no, machine_no=r.machine_no,
+        baseline_version=r.baseline_version,
+        machine_current_version=r.machine_current_version,
+        report_count=r.report_count, released_at=r.released_at)
+        for r in rows]
+
+
+@app.get("/releases/{work_order_no}", response_model=ReleaseOut,
+         summary="按工单查询放行结果（固化快照，不随后续修订改变）")
+def get_release(work_order_no: str = Path(
+                    min_length=1, max_length=64),
+                db: Session = Depends(get_db)) -> ReleaseOut:
+    row = db.scalar(select(WorkOrderRelease).where(
+        WorkOrderRelease.work_order_no == work_order_no))
+    if row is None:
+        raise HTTPException(status_code=404, detail={
+            "error": "release_not_found",
+            "work_order_no": work_order_no,
+            "message": f"工单 {work_order_no!r} 尚无放行记录"})
+    return _release_out_from_row(row)
 
 
 # ---------- 审查 ----------
