@@ -55,6 +55,13 @@
   相同完成声明并发/重放返回**同一报告**，成功完成后不同声明冲突且拒绝新块；
   全部状态落库，**跨服务重启保留**；
 - 报告**一旦生成不可变**，后续禁区更新新版本不影响任何旧报告；
+- **工单刀路审查放行**（`/releases`，见下文「工单刀路审查放行」）：车间按**工单**锁定一台
+  机床的放行结果——提交工单号、机床编号、预期基线版本及 **1～50 个有序报告编号**（不重复）；
+  各报告须**全部无碰撞**，且固化的**基线引用**（机床 + 版本）与**所用禁区版本清单**都与该机床
+  该基线版本一致；**预期版本仍是该机床当前版本时才能首次放行**。放行事务与基线修订互斥，
+  判定与记录对应**同一版本状态**。成功后固化工单号、报告顺序、基线版本、禁区版本快照与放行时间，
+  按工单查询的结果**不随后续基线修订改变**；同一工单**同内容重试返回原结果**，异内容 `409` 冲突，
+  重试不受后续修订影响；基线或报告不存在、版本过期、报告不合格一律拒绝且**不留部分记录**；
 - 非法几何、负/非法刀具半径、非法圆弧、不支持的运动/坐标系指令、非法开关类型，以及多刀模式下
   非整数/负数 `T`、同行多个 `T`、未映射刀号、非法映射半径一律返回 `422`，**不留任何报告**。
 
@@ -78,7 +85,8 @@ docker compose up --build
 v1.2 的多刀命中刀号/半径列（`collision_tool_no` / `collision_tool_radius`），
 以及 v1.3 的执行事件轨迹列（`execution_trace`）；v1.4 新增的 `batches` 批量审查表、
 v1.5 新增的 `upload_sessions` / `upload_chunks` 分块上传表
-与 v1.6 新增的 `zone_baselines` 机床基线表均由 `create_all` 对旧库幂等建出。
+与 v1.6 新增的 `zone_baselines` 机床基线表均由 `create_all` 对旧库幂等建出；
+v1.7 新增的 `releases` 工单放行表同样由 `create_all` 对旧库幂等建出。
 旧报告读取为 `min_clearance_enabled=false`、`min_clearance=null`，多刀字段为 `null`，
 `execution_trace=null`，旧请求行为不变。
 
@@ -581,6 +589,117 @@ curl -s -X POST "http://localhost:8080/uploads/$SID/complete" \
 
 `GET /reports/{report_id}`
 
+### 11. 工单刀路审查放行（按工单锁定一台机床，v1.7）
+
+审查报告全部合格后，车间按**工单**对某台机床做一次性放行锁定：提交工单号、机床编号、
+预期基线版本与 **1～50 个有序报告编号**，服务端在**同一事务**内完成全部校验并固化结果。
+基线修订与放行并发时，二者由数据库行锁串行化，放行的"当前版本"判定与放行记录对应
+**同一版本状态**，不会在判定与记录之间插入新修订。
+
+#### 11.1 提交放行
+
+`POST /releases`
+
+```json
+{
+  "work_order_no": "WO-20261007-001",
+  "machine_no": "MC-01",
+  "expected_baseline_version": 1,
+  "report_ids": [11, 12, 15]
+}
+```
+
+字段与规则：
+
+| 字段 | 说明 |
+| --- | --- |
+| `work_order_no` | 工单号（幂等键）；字母数字开头，可含 `_ . : -`，最长 64 |
+| `machine_no` | 机床编号；规则同上 |
+| `expected_baseline_version` | 预期的机床基线版本（≥ 1）；**必须仍是该机床当前（最大）版本**才能首次放行 |
+| `report_ids` | **1～50 个**有序报告编号；互不重复，**顺序是放行内容的一部分** |
+
+每份报告必须同时满足：
+
+1. 报告**存在**；
+2. `has_collision=false`（**无碰撞**）；
+3. 报告以该机床该基线版本的引用审查：`input_summary.baseline` 的 `machine_no` /
+   `version` 与请求一致（直传 `zones` 审查的报告、引用其他机床/版本基线的报告均不合格）；
+4. 报告固化的 `used_zone_versions`（所用禁区版本清单）与该基线版本的固定禁区清单
+   **完全一致**（禁区编号与明确版本一一对应）。
+
+全部满足且预期版本为当前版本时返回 `201`，固化内容：
+
+```json
+{
+  "work_order_no": "WO-20261007-001",
+  "machine_no": "MC-01",
+  "baseline_version": 1,
+  "zone_versions": [{"zone_no": 1, "version": 1}, {"zone_no": 2, "version": 3}],
+  "reports": [{"seq": 1, "report_id": 11}, {"seq": 2, "report_id": 12},
+              {"seq": 3, "report_id": 15}],
+  "released_at": "2026-10-07T01:23:45Z"
+}
+```
+
+- `zone_versions`：放行时该基线版本固化的**禁区版本快照**（按禁区编号升序）；
+- `reports`：按**提交顺序**固化的报告编号（`seq` 从 1 起）；
+- `released_at`：放行时间（UTC）。
+
+拒绝策略（**不留部分记录**，被拒工单号可在修正后重新提交）：
+
+| 情形 | 状态码 | `detail.error` |
+| --- | --- | --- |
+| 工单号/机床编号/版本/报告编号列表格式非法（空、超 50、重复、非正整数等） | 422 | 请求校验错误 |
+| 机床不存在任何基线 | 404 | `baseline_not_found` |
+| 该机床不存在预期基线版本 | 404 | `baseline_version_not_found` |
+| 某份报告不存在 | 404 | `report_not_found`（含 `seq` / `report_id`） |
+| 预期版本不是当前版本（基线已修订） | 409 | `baseline_version_stale`（含 `expected_version` / `current_version`） |
+| 报告碰撞、基线引用不一致或禁区版本清单不一致 | 422 | `reports_unqualified`（`unqualified` 逐项列 `seq`/`report_id`/`reasons`） |
+
+`reports_unqualified` 响应示例：
+
+```json
+{
+  "error": "reports_unqualified",
+  "work_order_no": "WO-20261007-001",
+  "machine_no": "MC-01",
+  "baseline_version": 1,
+  "unqualified": [
+    {"seq": 2, "report_id": 12,
+     "reasons": ["report_has_collision", "zone_versions_mismatch"]}
+  ],
+  "message": "1 份报告不满足放行条件（...），未生成放行记录"
+}
+```
+
+每份不合格报告的 `reasons` 取自：`report_has_collision`（报告有碰撞）、
+`baseline_reference_mismatch`（未以该机床该版本的基线引用审查）、
+`zone_versions_mismatch`（固化的禁区版本清单与该基线版本不一致）。
+
+#### 11.2 重试与冲突（工单号幂等）
+
+以 `work_order_no` 为幂等键，请求内容按（机床 + 预期版本 + 有序报告编号）规范化计算
+SHA-256：
+
+- **同一工单 + 相同内容**重试（即使期间基线已修订、时间已推移）：返回 `200` 与
+  **首次放行结果**（同一 `baseline_version`、同一报告顺序、同一快照），不生成新记录；
+- **同一工单 + 不同内容**（换机床、换预期版本、增删报告或改变顺序）：返回
+  `409 release_conflict`，**不重新校验、不覆盖**原记录；
+- 已放行工单的查询与重试**不受后续基线修订影响**。
+
+#### 11.3 按工单查询（固化结果）
+
+`GET /releases/{work_order_no}`
+
+返回 11.1 同形的固化结果；该结果**不随后续基线修订改变**（放行后即使该机床出现更新
+基线版本，返回的仍是放行时锁定的 `baseline_version` 与禁区版本快照）。工单从未放行
+返回 `404`。
+
+> 提示：报告由 `POST /reviews`、`POST /reviews/batch` 或 `/uploads/{id}/complete`
+> 以 `"baseline": {"machine_no": ..., "version": ...}` 引用生成后，再把合格的
+> `report_id` 按顺序提交给 `/releases`。基线修订后，原版本的报告不能再用于新版本
+> 放行（`baseline_version_stale`），需按当前基线版本重新审查。
+
 ## 命令行调用示例
 
 另见 `examples/curl_examples.sh` 与 `examples/python_client.py`。
@@ -631,6 +750,22 @@ curl -s -X POST http://localhost:8080/baselines \
   -H 'Content-Type: application/json' \
   -d '{"machine_no":"MC-01","zones":[{"zone_no":1,"version":2}]}'
 curl -s http://localhost:8080/baselines/MC-01
+
+# 工单放行：锁定机床 MC-01 当前基线版本 1 下的两份有序无碰撞报告
+# （报告须以该机床该版本基线审查，且 used_zone_versions 与基线清单一致）
+curl -s -X POST http://localhost:8080/releases \
+  -H 'Content-Type: application/json' \
+  -d '{"work_order_no":"WO-20261007-001","machine_no":"MC-01",
+       "expected_baseline_version":1,"report_ids":[2,3]}'
+
+# 同内容重试 => 200 返回首次固化结果；换顺序/换报告 => 409 release_conflict
+curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8080/releases \
+  -H 'Content-Type: application/json' \
+  -d '{"work_order_no":"WO-20261007-001","machine_no":"MC-01",
+       "expected_baseline_version":1,"report_ids":[2,3]}'
+
+# 按工单查询固化结果（基线后续修订也不改变）
+curl -s http://localhost:8080/releases/WO-20261007-001
 ```
 
 ## G-code 支持范围与拒绝策略
@@ -654,10 +789,10 @@ curl -s http://localhost:8080/baselines/MC-01
 
 ```
 app/
-  main.py        # FastAPI 路由：禁区/版本/机床基线/审查/批量审查/分块上传/报告
-  schemas.py     # 请求响应模型与输入校验（含执行事件轨迹、批量输出、分块上传与机床基线）
+  main.py        # FastAPI 路由：禁区/版本/机床基线/审查/批量审查/分块上传/报告/工单放行
+  schemas.py     # 请求响应模型与输入校验（含执行事件轨迹、批量输出、分块上传、机床基线与工单放行）
   models.py      # zones / zone_versions / zone_baselines / reports / batches
-                 # / upload_sessions / upload_chunks 表
+                 # / upload_sessions / upload_chunks / releases 表
   database.py    # 引擎与会话
   gcode.py       # G-code 词法/模态解析（含多刀 T 切换与静止换刀事件）
   geometry.py    # 多边形校验、点/线段/圆弧距离、弧-多边形最近点
@@ -694,4 +829,9 @@ Z 窗口截取/边界接触为零/负值/无运动段/等值裁决/固化与兼�
 不存在拒绝且不写入、审查以 机床编号+基线版本 解析快照并与直传 zones 同口径、
 基线快照不可变、zones 与 baseline 同传或均缺 422、基线不存在 404 且不落报告、
 批量项混用 baseline 与 zones 且任一项非法整批不落报告、分块上传建会话用 baseline
-且完成沿用快照、并发修订各获不同版本不丢失）等场景。
+且完成沿用快照、并发修订各获不同版本不丢失），
+以及工单刀路审查放行（有序合格报告首次放行并固化顺序/基线版本/禁区快照/放行时间、
+编号重复/超界/非法格式 422 且不留记录、碰撞报告/基线引用不一致/禁区清单不一致拒绝、
+被拒工单号不被占用、基线或版本或报告不存在 404、预期版本过期 409 且按当前版本重审后
+可放行、同内容重试 200 返回原结果且异内容 409、后续基线修订不改变查询与重试、
+并发同内容恰好一条放行记录、基线修订与放行并发互斥且判定与记录对应同一版本状态）等场景。

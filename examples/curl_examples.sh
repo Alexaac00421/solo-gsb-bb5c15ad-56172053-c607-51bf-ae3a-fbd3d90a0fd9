@@ -367,3 +367,70 @@ curl -s -o /dev/null -w "HTTP %{http_code}\n" -X POST "$BASE/reviews" \
   -d '{"zones": [{"zone_no": 1, "version": 1}],
        "baseline": {"machine_no": "MC-01", "version": 1},
        "start": [-5, 5, 0], "tool_radius": 0.0, "gcode": "G1 X1\n"}'
+
+echo "== 32) 工单放行：以机床基线产出两份无碰撞报告，按工单锁定该机床当前版本 =="
+# 用独立机床 MC-RL（首版 v1 = 禁区 1 的 v1）演示完整放行，不受第 29 步 MC-01
+# 修订影响。报告必须以 机床编号+基线版本 引用审查（固化基线引用与
+# used_zone_versions 快照）；放行提交工单号、机床编号、预期基线版本与
+# 1～50 个有序且不重复的报告编号
+curl -s -X POST "$BASE/baselines" \
+  -H 'Content-Type: application/json' \
+  -d '{"machine_no":"MC-RL","zones":[{"zone_no":1,"version":1}]}' > /dev/null
+R1=$(curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{"baseline": {"machine_no": "MC-RL", "version": 1}, "start": [-5, 50, 0],
+       "tool_radius": 0.0, "gcode": "G1 X15 Y50 Z0\n"}' \
+  | sed -n 's/.*"report_id":\([0-9]*\).*/\1/p')
+R2=$(curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{"baseline": {"machine_no": "MC-RL", "version": 1}, "start": [-5, 60, 0],
+       "tool_radius": 0.0, "gcode": "G1 X15 Y60 Z0\n"}' \
+  | sed -n 's/.*"report_id":\([0-9]*\).*/\1/p')
+echo "reports: $R1 $R2"
+curl -s -X POST "$BASE/releases" \
+  -H 'Content-Type: application/json' \
+  -d "{\"work_order_no\":\"WO-20261007-001\",\"machine_no\":\"MC-RL\",
+       \"expected_baseline_version\":1,\"report_ids\":[$R1,$R2]}"; echo
+
+echo "== 33) 同内容重试 => 200 返回首次固化结果；改顺序 => 409 release_conflict =="
+curl -s -o /dev/null -w "HTTP %{http_code}\n" -X POST "$BASE/releases" \
+  -H 'Content-Type: application/json' \
+  -d "{\"work_order_no\":\"WO-20261007-001\",\"machine_no\":\"MC-RL\",
+       \"expected_baseline_version\":1,\"report_ids\":[$R1,$R2]}"
+curl -s -o /dev/null -w "HTTP %{http_code}\n" -X POST "$BASE/releases" \
+  -H 'Content-Type: application/json' \
+  -d "{\"work_order_no\":\"WO-20261007-001\",\"machine_no\":\"MC-RL\",
+       \"expected_baseline_version\":1,\"report_ids\":[$R2,$R1]}"
+
+echo "== 34) 修订 MC-RL 后，按工单查询与同内容重试仍返回放行时的 v1 固化结果 =="
+curl -s -X POST "$BASE/baselines" \
+  -H 'Content-Type: application/json' \
+  -d '{"machine_no":"MC-RL","zones":[{"zone_no":1,"version":2}]}' > /dev/null
+curl -s "$BASE/releases/WO-20261007-001"; echo
+curl -s -o /dev/null -w "retry HTTP %{http_code}\n" -X POST "$BASE/releases" \
+  -H 'Content-Type: application/json' \
+  -d "{\"work_order_no\":\"WO-20261007-001\",\"machine_no\":\"MC-RL\",
+       \"expected_baseline_version\":1,\"report_ids\":[$R1,$R2]}"
+
+echo "== 35) 版本过期/碰撞报告/编号重复：分别 409 / 422 / 422，且不留部分记录 =="
+# MC-01 在第 29 步已修订到 v2、MC-RL 上一步也已到 v2：再按 v1 放行 => 409
+curl -s -X POST "$BASE/releases" \
+  -H 'Content-Type: application/json' \
+  -d "{\"work_order_no\":\"WO-STALE\",\"machine_no\":\"MC-RL\",
+       \"expected_baseline_version\":1,\"report_ids\":[$R1]}"; echo
+# 含碰撞报告 => 422 reports_unqualified（逐项给出 reasons）；禁区 1 的 v2 已平移
+# 到 [100,110]x[100,110]（第 6 步），按当前基线 v2 横穿该方块即碰撞
+HIT=$(curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{"baseline": {"machine_no": "MC-01", "version": 2}, "start": [95, 105, 0],
+       "tool_radius": 0.0, "gcode": "G1 X115 Y105 Z0\n"}' \
+  | sed -n 's/.*"report_id":\([0-9]*\).*/\1/p')
+curl -s -X POST "$BASE/releases" \
+  -H 'Content-Type: application/json' \
+  -d "{\"work_order_no\":\"WO-BAD\",\"machine_no\":\"MC-01\",
+       \"expected_baseline_version\":2,\"report_ids\":[$HIT]}"; echo
+# 编号重复 => 请求级 422
+curl -s -o /dev/null -w "HTTP %{http_code}\n" -X POST "$BASE/releases" \
+  -H 'Content-Type: application/json' \
+  -d "{\"work_order_no\":\"WO-DUP\",\"machine_no\":\"MC-01\",
+       \"expected_baseline_version\":2,\"report_ids\":[$R1,$R1]}"

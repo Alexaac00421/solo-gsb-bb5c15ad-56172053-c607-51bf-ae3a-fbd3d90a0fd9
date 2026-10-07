@@ -410,6 +410,104 @@ def main() -> None:
     assert missing_bl.status_code == 404
     print("zones+baseline rejected (422); missing baseline rejected (404)")
 
+    # 14. 工单刀路审查放行（/releases）：按工单锁定一台机床当前基线版本下的
+    #     1～50 个有序无碰撞报告；报告须以该机床该版本基线审查，且固化的
+    #     used_zone_versions 与基线清单一致。放行后固化工单/报告顺序/基线
+    #     版本/禁区快照/放行时间；同内容重试返回原结果，异内容冲突，查询与
+    #     重试不随后续基线修订改变。用独立机床 MC-RL 演示（第 13 步的 MC-01
+    #     已修订到 v2）。
+    c.post("/baselines", json={
+        "machine_no": "MC-RL",
+        "zones": [{"zone_no": 1, "version": 1}],
+    }).raise_for_status()
+    wo = "WO-20261007-001"
+    rep_ids = []
+    for y in (50.0, 60.0):
+        r = c.post("/reviews", json={
+            "baseline": {"machine_no": "MC-RL", "version": 1},
+            "start": [-5.0, y, 0.0], "tool_radius": 0.0,
+            "gcode": f"G1 X15 Y{y:g} Z0\n",
+        })
+        r.raise_for_status()
+        rep_ids.append(r.json()["report_id"])
+    rel = c.post("/releases", json={
+        "work_order_no": wo, "machine_no": "MC-RL",
+        "expected_baseline_version": 1, "report_ids": rep_ids,
+    })
+    rel.raise_for_status()  # 201
+    first = rel.json()
+    print("release:", first["work_order_no"],
+          "baseline v" + str(first["baseline_version"]),
+          "reports", [x["report_id"] for x in first["reports"]])
+    assert [x["seq"] for x in first["reports"]] == [1, 2]
+    assert first["zone_versions"] == [{"zone_no": 1, "version": 1}]
+
+    # 按工单查询固化结果
+    assert c.get(f"/releases/{wo}").json() == first
+
+    # 同内容重试 => 200 返回首次结果（即使基线随后修订）
+    same = c.post("/releases", json={
+        "work_order_no": wo, "machine_no": "MC-RL",
+        "expected_baseline_version": 1, "report_ids": rep_ids})
+    assert same.status_code == 200 and same.json() == first
+    # 改顺序 / 换报告 => 409 release_conflict，不覆盖
+    swapped = c.post("/releases", json={
+        "work_order_no": wo, "machine_no": "MC-RL",
+        "expected_baseline_version": 1,
+        "report_ids": list(reversed(rep_ids))})
+    assert swapped.status_code == 409
+    assert swapped.json()["detail"]["error"] == "release_conflict"
+    print("release replay 200; different content 409")
+
+    # 修订 MC-RL 到 v2 后：查询仍是 v1 固化结果，同内容重试仍 200
+    c.post("/baselines", json={
+        "machine_no": "MC-RL",
+        "zones": [{"zone_no": 1, "version": 2}]}).raise_for_status()
+    frozen = c.get(f"/releases/{wo}").json()
+    assert frozen["baseline_version"] == 1
+    assert c.post("/releases", json={
+        "work_order_no": wo, "machine_no": "MC-RL",
+        "expected_baseline_version": 1,
+        "report_ids": rep_ids}).status_code == 200
+
+    # 预期版本过期 => 409 baseline_version_stale（不留记录）
+    stale = c.post("/releases", json={
+        "work_order_no": "WO-STALE", "machine_no": "MC-RL",
+        "expected_baseline_version": 1, "report_ids": rep_ids})
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["error"] == "baseline_version_stale"
+    assert stale.json()["detail"]["current_version"] == 2
+
+    # 含碰撞报告 / 报告不存在 / 基线不存在：422 / 404 / 404，均不留部分记录
+    # 禁区 1 的 v2 已平移到 [100,110]x[100,110]（第 5 步），横穿即碰撞
+    hit = c.post("/reviews", json={
+        "baseline": {"machine_no": "MC-RL", "version": 2},
+        "start": [95.0, 105.0, 0.0], "tool_radius": 0.0,
+        "gcode": "G1 X115 Y105 Z0\n"}).json()["report_id"]
+    bad = c.post("/releases", json={
+        "work_order_no": "WO-BAD", "machine_no": "MC-RL",
+        "expected_baseline_version": 2, "report_ids": [hit]})
+    assert bad.status_code == 422
+    assert bad.json()["detail"]["unqualified"][0]["reasons"] == [
+        "report_has_collision"]
+    assert c.get("/releases/WO-BAD").status_code == 404  # 不留记录
+    no_report = c.post("/releases", json={
+        "work_order_no": "WO-NO-R", "machine_no": "MC-RL",
+        "expected_baseline_version": 2, "report_ids": [999999]})
+    assert no_report.status_code == 404
+    no_machine = c.post("/releases", json={
+        "work_order_no": "WO-NO-M", "machine_no": "NOPE",
+        "expected_baseline_version": 1, "report_ids": rep_ids})
+    assert no_machine.status_code == 404
+    # 编号重复 / 超 50 项 => 422
+    dup = c.post("/releases", json={
+        "work_order_no": "WO-DUP", "machine_no": "MC-RL",
+        "expected_baseline_version": 2,
+        "report_ids": [rep_ids[0], rep_ids[0]]})
+    assert dup.status_code == 422
+    print("release validation: stale 409, unqualified/malformed 422, "
+          "missing 404, no partial records")
+
 
 if __name__ == "__main__":
     main()

@@ -388,3 +388,54 @@ class UploadCompleteRequest(BaseModel):
     sha256: str = Field(min_length=64, max_length=64,
                         pattern=r"^[0-9a-fA-F]{64}$",
                         description="拼接后文本的 SHA-256（hex，大小写均可）")
+
+
+# ---------- 工单刀路审查放行（v1.7） ----------
+
+class ReleaseCreate(BaseModel):
+    """工单放行请求：工单号 + 机床编号 + 预期基线版本 + 1～50 个有序报告编号。
+
+    报告编号互不重复（顺序本身是放行内容的一部分）；服务端进一步要求全部
+    报告存在、无碰撞、固化的基线引用与该机床及预期版本一致、所用禁区版本
+    清单与该基线版本一致，且预期版本仍是该机床当前版本，才首次放行。
+    """
+    work_order_no: str = Field(min_length=1, max_length=64, pattern=_ID_PATTERN)
+    machine_no: str = Field(min_length=1, max_length=64, pattern=_ID_PATTERN)
+    expected_baseline_version: int = Field(ge=1)
+    report_ids: list[int] = Field(min_length=1, max_length=50)
+
+    @field_validator("report_ids", mode="before")
+    @classmethod
+    def _report_ids_distinct_positive(cls, v):
+        # before 模式拿到原始 JSON：显式拒绝布尔（pydantic 默认会把 True
+        # 宽松 coerce 为 1）与非整数/字符串；长度上下界由 Field 约束
+        if not isinstance(v, list):
+            return v  # 交回 pydantic 产出标准类型错误
+        seen: set[int] = set()
+        for rid in v:
+            if isinstance(rid, bool) or not isinstance(rid, int) or rid < 1:
+                raise ValueError("报告编号必须为不小于 1 的整数")
+            if rid in seen:
+                raise ValueError(f"报告编号 {rid} 在请求中重复")
+            seen.add(rid)
+        return v
+
+
+class ReleaseReportOut(BaseModel):
+    """放行结果中的一项：提交顺序号与该顺序上的报告编号。"""
+    seq: int = Field(description="提交顺序号（从 1 起）")
+    report_id: int
+
+
+class ReleaseOut(BaseModel):
+    """工单放行结果：固化工单号、机床、基线版本、禁区版本快照、报告顺序与放行时间。
+
+    一旦放行即不可变：后续基线修订（该机床出现更新版本）不影响本结果。
+    """
+    work_order_no: str
+    machine_no: str
+    baseline_version: int
+    zone_versions: list[ZoneRef] = Field(
+        description="放行时该基线版本固化的禁区编号+明确版本清单")
+    reports: list[ReleaseReportOut] = Field(description="按提交顺序固化的报告编号")
+    released_at: datetime

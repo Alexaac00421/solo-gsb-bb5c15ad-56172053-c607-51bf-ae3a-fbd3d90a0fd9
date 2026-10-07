@@ -7,7 +7,9 @@
 - reports：审查报告，创建后不可变，不随后续禁区版本变化；
 - batches：批量审查批次（batch_id 幂等键 + 内容哈希 + 逐项结果快照）；
 - upload_sessions / upload_chunks：长 G-code 可恢复分块上传会话及其文本块，
-  全部状态落库，跨服务重启保留。
+  全部状态落库，跨服务重启保留；
+- releases：工单刀路审查放行（v1.7），按工单号锁定一台机床当前基线版本下的
+  一组有序无碰撞报告，工单号唯一、内容哈希区分重放与冲突，放行后永久固化。
 """
 from __future__ import annotations
 
@@ -197,3 +199,42 @@ class UploadChunk(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
     session = relationship("UploadSession", back_populates="chunks")
+
+
+class Release(Base):
+    """工单刀路审查放行（v1.7）：车间按工单锁定一台机床的放行结果。
+
+    一次放行提交工单号、机床编号、预期基线版本与 1～50 个有序报告编号：
+    编号不重复，报告须全部无碰撞，且每份报告固化的基线引用（input_summary
+    中的 machine_no + version）与所用禁区版本清单（used_zone_versions）
+    都与该机床该基线版本一致；仅当预期版本仍是该机床当前（最大）版本时
+    才能首次放行。放行事务对该机床基线行加锁，与基线修订互斥，保证判定与
+    记录对应同一版本状态。
+
+    成功后工单号（唯一）、机床、报告顺序、基线版本、基线禁区版本快照与
+    放行时间一并固化：按工单查询不随后续基线修订改变。content_hash 为请求
+    内容（机床 + 预期版本 + 有序报告编号规范化）的 SHA-256：同一工单同内容
+    重试返回原结果，异内容冲突（409），重试不受后续基线修订影响。
+    """
+
+    __tablename__ = "releases"
+    __table_args__ = (
+        CheckConstraint("baseline_version >= 1",
+                        name="ck_release_baseline_version_positive"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    # 工单号为幂等键（字母数字开头，可含 _ . : -，最长 64），唯一约束兜底并发
+    work_order_no = Column(String(64), nullable=False, unique=True)
+    machine_no = Column(String(64), nullable=False)
+    # 放行时锁定的基线版本（该机床当前版本）与基线禁区版本快照
+    baseline_version = Column(Integer, nullable=False)
+    # 放行时该基线版本固化的禁区清单 [{"zone_no": int, "version": int}, ...]
+    zone_versions = Column(JSON, nullable=False)
+    # 有序报告编号（按提交顺序，1～50 个且互不重复）
+    report_ids = Column(JSON, nullable=False)
+    # 请求内容（机床 + 预期版本 + 有序报告编号规范化）的 SHA-256
+    content_hash = Column(String(64), nullable=False)
+    released_at = Column(DateTime(timezone=True), nullable=False,
+                         default=_utcnow)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
